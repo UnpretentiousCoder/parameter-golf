@@ -1167,7 +1167,17 @@ def eval_val_sliding_ttt(
     log0(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
          f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
 
-    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    # optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+
+    # Split params: matrix params for Muon, everything else for SGD
+    ttt_matrix_params = [p for p in ttt_params if p.ndim == 2]
+    ttt_scalar_params = [p for p in ttt_params if p.ndim != 2]
+
+    # Muon for matrix weights (orthogonal updates), SGD for scalars/embeddings
+    ttt_muon = Muon(ttt_matrix_params, lr=args.ttt_lr, momentum=args.ttt_momentum, backend_steps=3)
+    ttt_sgd = torch.optim.SGD(ttt_scalar_params, lr=args.ttt_lr * 0.1, momentum=args.ttt_momentum)
+    ttt_optimizers = [ttt_muon, ttt_sgd]
+    
     t0 = time.perf_counter()
 
     for ci in range(num_chunks):
@@ -1237,7 +1247,8 @@ def eval_val_sliding_ttt(
                         local = val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64)
                         x = local[:-1].reshape(-1, seq_len)
                         y = local[1:].reshape(-1, seq_len)
-                        optimizer.zero_grad(set_to_none=True)
+                        for opt in ttt_optimizers:
+                            opt.zero_grad()
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                             loss = base_model(x, y)
                         loss.backward()
@@ -1246,7 +1257,8 @@ def eval_val_sliding_ttt(
                                 if p.grad is not None:
                                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
                         torch.nn.utils.clip_grad_norm_(ttt_params, args.ttt_grad_clip)
-                        optimizer.step()
+                        for opt in ttt_optimizers:
+                            opt.step()
 
         if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
             elapsed = time.perf_counter() - t0
